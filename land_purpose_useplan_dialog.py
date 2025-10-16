@@ -32,6 +32,7 @@ from qgis.PyQt.QtCore import QThread, pyqtSignal, QObject
 import json
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from qgis.core import QgsGeometry
 
 # This loads your .ui file so that PyQt can populate your plugin with the elements from Qt Designer
 FORM_CLASS, _ = uic.loadUiType(os.path.join(
@@ -93,14 +94,31 @@ class FeatureFetchWorker(QObject):
                 f"output=application/json&key={self.api_key}&domain="
             )
             api_response = None
-            try:
-                resp = requests.get(url, timeout=10)
-                data = resp.json()
-                api_response = data["features"][0]["properties"] if "features" in data and data["features"] else None
-            except Exception:
-                api_response = None
+            feature_geom = None
+            for attempt in range(1, 4):
+                try:
+                    resp = requests.get(url, timeout=10)
+                    data = resp.json()
+                    if "features" in data and data["features"]:
+                        api_feature = data["features"][0]
+                        api_response = api_feature.get("properties", None)
+                        feature_geom = api_feature.get("geometry", None)
+                    break
+                except Exception:
+                    if attempt == 3:
+                        break
+                    continue
             merged_props = self.merge_properties(feat, api_response)
-            geom = {"type": "Point", "coordinates": [x, y]}
+            # 도형 우선순위: 1. API geometry, 2. 원본 feature geometry
+            geom = None
+            if feature_geom:
+                geom = feature_geom
+            else:
+                qgs_geom = feat.geometry()
+                if not qgs_geom.isEmpty():
+                    geom = json.loads(qgs_geom.asJson())
+            if geom is None:
+                return None
             return {"type": "Feature", "geometry": geom, "properties": merged_props}
 
         with ThreadPoolExecutor() as executor:
@@ -156,13 +174,14 @@ class land_purpose_useplanDialog(QtWidgets.QDialog, FORM_CLASS):
         if not layer:
             QtWidgets.QMessageBox.warning(self, "알림", "레이어를 선택하세요.")
             return
-        # 사용자가 선택한 필드명
+        # 선택 레이어명 저장(결과 레이어 명칭에 활용)
+        self.selected_layer_name = layer.name()
         lon_field = self.mFieldComboBox.currentField()
         lat_field = self.mFieldComboBox_2.currentField()
         if not lon_field or not lat_field:
             QtWidgets.QMessageBox.warning(self, "알림", "경도/위도 필드를 선택하세요.")
             return
-        api_key = '3D81B08F-68E8-3930-A54D-13816E1E90B2' # 또는 config/입력 등
+        api_key = '3D81B08F-68E8-3930-A54D-13816E1E90B2'
         self.pbRun.setEnabled(False)
         self.worker = FeatureFetchWorker(layer, api_key, lon_field, lat_field)
         self.worker_thread = QThread()
@@ -178,12 +197,13 @@ class land_purpose_useplanDialog(QtWidgets.QDialog, FORM_CLASS):
     def _on_finished(self, geojson_path):
         self.pbRun.setEnabled(True)
         self.pbPercent.setValue(100)
-        # 결과 레이어 불러오기 + 안내 메시지
+        # 결과 레이어명: 선택 레이어에 '_지목이용계획추가' 붙이기
+        display_name = self.selected_layer_name + '_지목이용계획추가' if hasattr(self, 'selected_layer_name') else 'API_결과'
         if geojson_path and geojson_path.endswith('.geojson'):
-            result_layer = QgsVectorLayer(geojson_path, "API_결과", "ogr")
+            result_layer = QgsVectorLayer(geojson_path, display_name, "ogr")
             if result_layer.isValid():
                 QgsProject.instance().addMapLayer(result_layer)
-                QtWidgets.QMessageBox.information(self, "완료", "결과 레이어를 QGIS에 추가하였습니다.")
+                QtWidgets.QMessageBox.information(self, "완료", f"결과 레이어({display_name})를 QGIS에 추가하였습니다.")
             else:
                 QtWidgets.QMessageBox.warning(self, "오류", "GeoJSON 레이어 로드 실패!")
         self.accept()
