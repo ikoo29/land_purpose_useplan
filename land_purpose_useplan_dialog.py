@@ -26,19 +26,167 @@ import os
 
 from qgis.PyQt import uic
 from qgis.PyQt import QtWidgets
+from qgis.core import QgsMapLayerProxyModel
+from qgis.core import QgsProject, QgsVectorLayer, QgsMapLayerProxyModel
+from qgis.PyQt.QtCore import QThread, pyqtSignal, QObject
+import json
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # This loads your .ui file so that PyQt can populate your plugin with the elements from Qt Designer
 FORM_CLASS, _ = uic.loadUiType(os.path.join(
     os.path.dirname(__file__), 'land_purpose_useplan_dialog_base.ui'))
 
 
+class FeatureFetchWorker(QObject):
+    progressChanged = pyqtSignal(int)
+    finished = pyqtSignal(str)
+
+    def __init__(self, layer, api_key, lon_field, lat_field, batch_size=100, parent=None):
+        super().__init__(parent)
+        self.layer = layer
+        self.api_key = api_key
+        self.lon_field = lon_field
+        self.lat_field = lat_field
+        self.batch_size = batch_size
+        self._is_stopped = False
+
+    def stop(self):
+        self._is_stopped = True
+
+    def run(self):
+        features_list = list(self.layer.getFeatures())
+        total = len(features_list)
+        features = []
+        completed = 0
+        for start_idx in range(0, total, self.batch_size):
+            if self._is_stopped:
+                break
+            batch_feats = features_list[start_idx:start_idx + self.batch_size]
+            results = self.fetch_batch(batch_feats)
+            features.extend(results)
+            completed = min(total, start_idx + len(batch_feats))
+            self.progressChanged.emit(int(completed / total * 100))
+        output_path = "result_from_layer.geojson"
+        result_geojson = {
+            "type": "FeatureCollection",
+            "features": features
+        }
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(result_geojson, f, ensure_ascii=False, indent=2)
+        self.finished.emit(output_path)
+
+    def fetch_batch(self, batch_feats):
+        features = []
+        def process_feature(feat):
+            x = feat[self.lon_field]
+            y = feat[self.lat_field]
+            try:
+                x = float(x)
+                y = float(y)
+            except Exception:
+                return None
+            url = (
+                f"https://api.vworld.kr/ned/wfs/getLandUseWFS?"
+                f"typename=dt_d154&bbox={x},{y},{x},{y},EPSG:4326&"
+                f"pnu=&maxFeatures=10&resultType=results&srsName=EPSG:4326&"
+                f"output=application/json&key={self.api_key}&domain="
+            )
+            api_response = None
+            try:
+                resp = requests.get(url, timeout=10)
+                data = resp.json()
+                api_response = data["features"][0]["properties"] if "features" in data and data["features"] else None
+            except Exception:
+                api_response = None
+            merged_props = self.merge_properties(feat, api_response)
+            geom = {"type": "Point", "coordinates": [x, y]}
+            return {"type": "Feature", "geometry": geom, "properties": merged_props}
+
+        with ThreadPoolExecutor() as executor:
+            futs = [executor.submit(process_feature, feat) for feat in batch_feats]
+            for fut in as_completed(futs):
+                result = fut.result()
+                if result:
+                    features.append(result)
+        return features
+
+    def merge_properties(self, feat, api_properties):
+        props = feat.attributes()
+        field_names = [f.name() for f in self.layer.fields()]
+        props_dict = {}
+        for i, field_name in enumerate(field_names):
+            val = props[i]
+            props_dict[field_name] = str(val) if val is not None else ""
+        # API 응답 필드 취합
+        lnm = api_properties.get('lnm_lndcgr_smbol', '') if api_properties else ''
+        jimok_val = ''
+        if isinstance(lnm, str):
+            no_space = lnm.replace(' ', '')
+            if len(no_space) > 0:
+                jimok_val = no_space[-1]
+        landuse_code = api_properties.get('prpos_area_dstrc_code_list', '') if api_properties else ''
+        landuse_nm = api_properties.get('prpos_area_dstrc_nm_list', '') if api_properties else ''
+        cnflc_code = api_properties.get('cnflc_at_list', '') if api_properties else ''
+        cnflc_nm = api_properties.get('cnflc_at_nm_list', '') if api_properties else ''
+        props_dict['지목'] = jimok_val
+        props_dict['토지이용계획코드'] = landuse_code
+        props_dict['토지이용계획'] = landuse_nm
+        props_dict['포함저촉코드'] = cnflc_code
+        props_dict['포함저촉'] = cnflc_nm
+        return props_dict
+
 class land_purpose_useplanDialog(QtWidgets.QDialog, FORM_CLASS):
     def __init__(self, parent=None):
-        """Constructor."""
         super(land_purpose_useplanDialog, self).__init__(parent)
-        # Set up the user interface from Designer through FORM_CLASS.
-        # After self.setupUi() you can access any designer object by doing
-        # self.<objectname>, and you can use autoconnect slots - see
-        # http://qt-project.org/doc/qt-4.8/designer-using-a-ui-file.html
-        # #widgets-and-dialogs-with-auto-connect
         self.setupUi(self)
+        self.LayerName.setFilters(QgsMapLayerProxyModel.VectorLayer)
+        self.LayerName.layerChanged.connect(self._on_layer_changed)
+        self.pbRun.clicked.connect(self._on_run_clicked)
+        self.pbCancel.clicked.connect(self.reject)
+        self.worker_thread = None
+        self.worker = None
+
+    def _on_layer_changed(self, layer):
+        self.mFieldComboBox.setLayer(layer)
+        self.mFieldComboBox_2.setLayer(layer)
+
+    def _on_run_clicked(self):
+        layer = self.LayerName.currentLayer()
+        if not layer:
+            QtWidgets.QMessageBox.warning(self, "알림", "레이어를 선택하세요.")
+            return
+        # 사용자가 선택한 필드명
+        lon_field = self.mFieldComboBox.currentField()
+        lat_field = self.mFieldComboBox_2.currentField()
+        if not lon_field or not lat_field:
+            QtWidgets.QMessageBox.warning(self, "알림", "경도/위도 필드를 선택하세요.")
+            return
+        api_key = '3D81B08F-68E8-3930-A54D-13816E1E90B2' # 또는 config/입력 등
+        self.pbRun.setEnabled(False)
+        self.worker = FeatureFetchWorker(layer, api_key, lon_field, lat_field)
+        self.worker_thread = QThread()
+        self.worker.moveToThread(self.worker_thread)
+        self.worker.progressChanged.connect(self.pbPercent.setValue)
+        self.worker.finished.connect(self._on_finished)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker_thread.start()
+
+    def _on_finished(self, geojson_path):
+        self.pbRun.setEnabled(True)
+        self.pbPercent.setValue(100)
+        # 결과 레이어 불러오기 + 안내 메시지
+        if geojson_path and geojson_path.endswith('.geojson'):
+            result_layer = QgsVectorLayer(geojson_path, "API_결과", "ogr")
+            if result_layer.isValid():
+                QgsProject.instance().addMapLayer(result_layer)
+                QtWidgets.QMessageBox.information(self, "완료", "결과 레이어를 QGIS에 추가하였습니다.")
+            else:
+                QtWidgets.QMessageBox.warning(self, "오류", "GeoJSON 레이어 로드 실패!")
+        self.accept()
+
+
+        
